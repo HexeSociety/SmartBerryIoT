@@ -1,4 +1,3 @@
-
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DHT.h>
@@ -7,6 +6,8 @@
 #include <time.h>
 #include <sys/time.h>
 #include <math.h>
+
+#include "TelemetriaApi.h"
 
 // ======================================
 // CONFIGURACOES WIFI
@@ -57,6 +58,7 @@ bool serverStarted = false;
 bool ntpConfigured = false;
 
 float currentTemp = NAN;
+float currentHumidity = NAN;
 
 unsigned long lastDhtRead = 0;
 unsigned long lastWifiAttempt = 0;
@@ -1630,6 +1632,14 @@ void handleState() {
     json += String(currentTemp, 1);
   }
 
+  json += ",\"humidity\":";
+
+  if (isnan(currentHumidity)) {
+    json += "null";
+  } else {
+    json += String(currentHumidity, 1);
+  }
+
   json += ",\"pump\":";
   json += isPumpOn ? "true" : "false";
 
@@ -1981,6 +1991,7 @@ void setup() {
   Serial.println("LCD iniciado.");
 
   currentTemp = dht.readTemperature();
+  currentHumidity = dht.readHumidity();
 
   updateLCD();
   checkTemperatureControl();
@@ -2018,6 +2029,9 @@ void setup() {
   // Inicia apenas quando conectado
   startServer();
 
+  // Inicializa a comunicacao com a API Java
+  TelemetriaApi::iniciar();
+
   Serial.println();
   Serial.println("SmartBerry inicializado!");
 }
@@ -2040,15 +2054,16 @@ void loop() {
     server.handleClient();
   }
 
-  if (
-    millis() - lastDhtRead >= DHT_INTERVAL
-  ) {
+  // Leitura dos sensores
+  if (millis() - lastDhtRead >= DHT_INTERVAL) {
 
     lastDhtRead = millis();
 
     float t = dht.readTemperature();
+    float h = dht.readHumidity();
 
-    if (!isnan(t)) {
+    // Temperatura
+    if (isfinite(t)) {
 
       if (
         isnan(currentTemp) ||
@@ -2059,13 +2074,31 @@ void loop() {
       }
 
     } else {
-
-      Serial.println(
-        "Falha na leitura do DHT22."
-      );
+      Serial.println("Falha na leitura da temperatura.");
     }
 
+    // Umidade
+    if (isfinite(h) && h >= 0 && h <= 100) {
+
+      currentHumidity = h;
+
+    } else {
+      currentHumidity = NAN;
+      Serial.println("Falha na leitura da umidade.");
+    }
+
+    // Controle automatico da ventilacao
     checkTemperatureControl();
+
+    // Exibe as leituras no monitor serial
+    Serial.printf(
+      "Temperatura: %.1f C | Umidade: %.1f %%\n",
+      t,
+      h
+    );
+
+    // Envia somente leituras novas e validas
+    TelemetriaApi::enviarSeNecessario(t, h);
   }
 
   delay(1);
