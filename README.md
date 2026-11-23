@@ -147,9 +147,9 @@ pelo Gerenciador de Bibliotecas do Arduino IDE:
 As demais bibliotecas acompanham o ambiente de
 desenvolvimento e o pacote de suporte ao ESP32.
 
-## 🖥️ Interface web
+## 🖥️ Interface web legada
 
-O ESP32 disponibiliza uma interface web responsiva,
+Quando habilitado com `SMARTBERRY_WEB_PANEL_ENABLED=1`, o ESP32 disponibiliza uma interface web responsiva,
 desenvolvida com base na identidade visual do aplicativo
 SmartBerry360°.
 
@@ -237,8 +237,8 @@ SmartBerry-IoT/
 - [x] Sincronização de horário.
 - [ ] Monitoramento de umidade pela interface.
 - [ ] Histórico de dados ambientais.
-- [ ] Integração com a API Spring Boot.
-- [ ] Integração com o aplicativo Android.
+- [x] Integração com a API Spring Boot.
+- [x] Integração com o aplicativo Android via Spring Boot.
 - [ ] Autenticação e segurança dos endpoints.
 
 ## ⚠️ Observações
@@ -260,3 +260,18 @@ SmartBerry-IoT/
   Tecnologia & Agricultura<br>
   Gestão inteligente para sua estufa.
 </p>
+
+
+## Integração com a SmartBerryAPI
+
+1. Copie `SmartBerry360/SmartBerryApiConfig.example.h` para `SmartBerry360/SmartBerryApiConfig.h`.
+2. Preencha `SMARTBERRY_API_URL` com o IP do computador e a porta da API e `SMARTBERRY_API_KEY` com a mesma chave configurada no servidor.
+3. Configure o Wi-Fi e grave o firmware na placa. A placa, o computador e o celular precisam alcançar a API na mesma rede. O arquivo local com a chave é ignorado pelo Git.
+
+O firmware usa o endereço MAC de fábrica para se cadastrar automaticamente e recebe seu ID da API. Um ID já instalado pode ser mantido com a opção `SMARTBERRY_ESP32_ID`. O firmware envia temperatura, umidade e o estado dos relés. Ele consulta e confirma comandos endereçados à placa. Se perder a conexão durante a confirmação, retenta a confirmação sem reacionar o relé. Se reiniciar durante uma execução cujo resultado ficou incerto, informa a rejeição sem repetir o acionamento. O painel web, o agendamento diário e a automação por temperatura continuam na placa.
+
+## Agendas controladas pelo Android
+
+O firmware usa o painel web e as rotinas autônomas legadas apenas quando compilado com `SMARTBERRY_WEB_PANEL_ENABLED=1`. O padrão é `0`, com horários e recorrência configurados no Android e processados pela API. A configuração de rede e a telemetria continuam funcionando nesse modo.
+
+A placa recebe as partidas pela fila existente, rejeita novas partidas no mesmo relé enquanto já estiver ligado e usa temporizadores locais de 1 a 300 segundos. Ela confirma o acionamento à API. O desligamento ocorre localmente, mesmo se a rede cair após a partida. As medições do DHT22 continuam sendo usadas para monitoramento ambiental.
