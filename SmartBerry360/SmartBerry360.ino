@@ -13,6 +13,9 @@
 #ifndef SMARTBERRY_ESP32_ID
 #define SMARTBERRY_ESP32_ID ""
 #endif
+#ifndef SMARTBERRY_WEB_PANEL_ENABLED
+#define SMARTBERRY_WEB_PANEL_ENABLED 0
+#endif
 #include <WebServer.h>
 #include <DHT.h>
 #include <LiquidCrystal_I2C.h>
@@ -75,6 +78,10 @@ bool validSensorSample = false;
 bool remotePumpTimed = false;
 unsigned long remotePumpStart = 0;
 unsigned long remotePumpDuration = 0;
+unsigned long lastRequestedPumpStop = 0;
+bool remoteVentTimed = false;
+unsigned long remoteVentStart = 0;
+unsigned long remoteVentDuration = 0;
 unsigned long lastTelemetry = 0;
 unsigned long lastCommandPoll = 0;
 unsigned long telemetryInterval = 5000;
@@ -180,7 +187,7 @@ void setVent(bool on) {
 // ======================================
 
 void checkTemperatureControl() {
-  if (!autoVent || isnan(currentTemp)) {
+  if (!SMARTBERRY_WEB_PANEL_ENABLED || !autoVent || isnan(currentTemp)) {
     return;
   }
 
@@ -319,7 +326,18 @@ void handleTime() {
 // AGENDAMENTO DA BOMBA
 // ======================================
 
+void rememberRequestedPumpStop() {
+  lastRequestedPumpStop = millis();
+  struct tm local;
+  if (scheduleEnabled && readClock(local)
+      && local.tm_hour == scheduleHour && local.tm_min == scheduleMinute) {
+    lastRunDay = dayKey(local);
+    prefs.putInt("lastday", lastRunDay);
+  }
+}
+
 void checkPumpSchedule() {
+  if (!SMARTBERRY_WEB_PANEL_ENABLED) return;
 
   // Finaliza uma irrigacao em andamento
   if (scheduledPumpRunning) {
@@ -1754,6 +1772,7 @@ void handleToggle() {
       return;
     }
 
+    if (isPumpOn) rememberRequestedPumpStop();
     setPump(!isPumpOn);
 
   } else if (device == "vent") {
@@ -1894,6 +1913,7 @@ void connectWiFi() {
 }
 
 void startServer() {
+  if (!SMARTBERRY_WEB_PANEL_ENABLED) return;
 
   if (serverStarted) return;
 
@@ -2008,7 +2028,8 @@ void sendTelemetry() {
     "{\"temperatura\":%.1f,\"umidade\":%.1f,\"irrigacaoLigada\":%s,\"ventilacaoLigada\":%s,"
     "\"irrigacaoAutomatica\":%s,\"ventilacaoAutomatica\":%s}",
     currentTemp, currentHumidity, isPumpOn ? "true" : "false", isVentOn ? "true" : "false",
-    scheduleEnabled ? "true" : "false", autoVent ? "true" : "false");
+    (SMARTBERRY_WEB_PANEL_ENABLED && scheduleEnabled) ? "true" : "false",
+    (SMARTBERRY_WEB_PANEL_ENABLED && autoVent) ? "true" : "false");
   http.addHeader("Content-Type", "application/json");
   int status = http.POST(body);
   if (status == 201) telemetryChanged = false;
@@ -2017,18 +2038,38 @@ void sendTelemetry() {
   http.end();
 }
 
-bool executeCommand(const String &type, int value) {
+bool executeCommand(const String &type, int value, bool apiScheduled) {
   if (type == "ACIONAR_IRRIGACAO") {
     if (isPumpOn || scheduledPumpRunning || value < 1 || value > 300) return false;
+    if (apiScheduled && lastRequestedPumpStop != 0
+        && millis() - lastRequestedPumpStop < 30000UL) return false;
     setPump(true);
     remotePumpStart = millis();
     remotePumpDuration = value * 1000UL;
     remotePumpTimed = true;
   } else if (type == "PARAR_IRRIGACAO") {
     if (scheduledPumpRunning) return false;
+    rememberRequestedPumpStop();
     setPump(false);
+  } else if (type == "CONFIGURAR_IRRIGACAO_AUTOMATICA") {
+    if (!SMARTBERRY_WEB_PANEL_ENABLED) return false;
+    if (value != 0 && value != 1) return false;
+    bool enabled = value == 1;
+    if (scheduleEnabled != enabled && prefs.putBool("enabled", enabled) == 0) return false;
+    scheduleEnabled = enabled;
+    telemetryChanged = true;
+    if (!scheduleEnabled && scheduledPumpRunning) {
+      scheduledPumpRunning = false;
+      setPump(false);
+    }
+  } else if (type == "ACIONAR_VENTILACAO_TEMPORIZADA") {
+    if (isVentOn || (SMARTBERRY_WEB_PANEL_ENABLED && autoVent) || value < 1 || value > 300) return false;
+    setVent(true);
+    remoteVentStart = millis();
+    remoteVentDuration = value * 1000UL;
+    remoteVentTimed = true;
   } else if (type == "LIGAR_VENTILACAO" || type == "DESLIGAR_VENTILACAO") {
-    if (autoVent) return false;
+    if (SMARTBERRY_WEB_PANEL_ENABLED && autoVent) return false;
     setVent(type == "LIGAR_VENTILACAO");
   } else if (type == "ALTERAR_INTERVALO" && value > 0 && value <= 3600) {
     telemetryInterval = value * 1000UL;
@@ -2071,7 +2112,9 @@ void pollCommand() {
   String type = commandType == nullptr ? "" : commandType;
   bool correctDevice = deviceId != nullptr && apiDeviceId == deviceId;
   const cJSON *number = cJSON_GetObjectItemCaseSensitive(command, "valor");
-  int value = cJSON_IsNumber(number) ? number->valueint : 0;
+  int value = cJSON_IsNumber(number) ? number->valueint : -1;
+  const cJSON *scheduledTime = cJSON_GetObjectItemCaseSensitive(command, "programadoPara");
+  bool apiScheduled = scheduledTime != nullptr && !cJSON_IsNull(scheduledTime);
   cJSON_Delete(command);
   if (id.length() == 0 || !correctDevice) return;
 
@@ -2079,7 +2122,7 @@ void pollCommand() {
   // impede o reacionamento e comunica o resultado incerto como rejeitado.
   if (prefs.putString("apiCommand", id + "/rejeitado") == 0) return;
   pendingAck = id;
-  bool done = executeCommand(type, value);
+  bool done = executeCommand(type, value, apiScheduled);
   pendingOutcome = done ? "executado" : "rejeitado";
   if (done) prefs.putString("apiCommand", id + "/executado");
   confirmCommand();
@@ -2207,6 +2250,9 @@ void loop() {
   // Verifica agendamento mesmo sem WiFi
   if (remotePumpTimed && millis() - remotePumpStart >= remotePumpDuration) {
     setPump(false);
+  }
+  if (remoteVentTimed && millis() - remoteVentStart >= remoteVentDuration) {
+    setVent(false);
   }
   checkPumpSchedule();
 
