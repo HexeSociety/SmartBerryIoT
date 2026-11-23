@@ -1,5 +1,18 @@
 
 #include <WiFi.h>
+#include <HTTPClient.h>
+#include <cJSON.h>
+
+#if __has_include("SmartBerryApiConfig.h")
+#include "SmartBerryApiConfig.h"
+#else
+#define SMARTBERRY_API_URL ""
+#define SMARTBERRY_API_KEY ""
+#endif
+
+#ifndef SMARTBERRY_ESP32_ID
+#define SMARTBERRY_ESP32_ID ""
+#endif
 #include <WebServer.h>
 #include <DHT.h>
 #include <LiquidCrystal_I2C.h>
@@ -57,6 +70,19 @@ bool serverStarted = false;
 bool ntpConfigured = false;
 
 float currentTemp = NAN;
+float currentHumidity = NAN;
+bool validSensorSample = false;
+bool remotePumpTimed = false;
+unsigned long remotePumpStart = 0;
+unsigned long remotePumpDuration = 0;
+unsigned long lastTelemetry = 0;
+unsigned long lastCommandPoll = 0;
+unsigned long telemetryInterval = 5000;
+bool telemetryChanged = true;
+String pendingAck;
+String pendingOutcome;
+String apiDeviceId = SMARTBERRY_ESP32_ID;
+unsigned long lastRegistrationAttempt = 0;
 
 unsigned long lastDhtRead = 0;
 unsigned long lastWifiAttempt = 0;
@@ -116,6 +142,8 @@ void updateLCD() {
 // ======================================
 
 void setPump(bool on) {
+  remotePumpTimed = false;
+  telemetryChanged |= isPumpOn != on;
   isPumpOn = on;
 
   digitalWrite(
@@ -131,6 +159,7 @@ void setPump(bool on) {
 void setVent(bool on) {
   if (isVentOn == on) return;
 
+  telemetryChanged = true;
   isVentOn = on;
 
   digitalWrite(
@@ -1939,6 +1968,145 @@ void checkWiFi() {
   }
 }
 
+// A rede é consultada com timeouts curtos para manter o painel e os relés responsivos.
+bool beginApi(HTTPClient &http, const String &path) {
+  if (!http.begin(String(SMARTBERRY_API_URL) + path)) return false;
+  http.setConnectTimeout(500);
+  http.setTimeout(700);
+  http.addHeader("X-SmartBerry-Key", SMARTBERRY_API_KEY);
+  return true;
+}
+
+void registerDevice() {
+  char code[19];
+  snprintf(code, sizeof(code), "esp32-%012llx",
+           static_cast<unsigned long long>(ESP.getEfuseMac() & 0xFFFFFFFFFFFFULL));
+
+  HTTPClient http;
+  if (!beginApi(http, String("/api/esp32/registro/") + code)) return;
+  int status = http.PUT("");
+  if (status == 200) {
+    String body = http.getString();
+    cJSON *device = cJSON_Parse(body.c_str());
+    if (device != nullptr) {
+      const char *id = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(device, "id"));
+      if (id != nullptr) apiDeviceId = id;
+      cJSON_Delete(device);
+    }
+  } else {
+    Serial.printf("Falha no cadastro do ESP32: %d\n", status);
+  }
+  http.end();
+}
+
+void sendTelemetry() {
+  if (!validSensorSample) return;
+  HTTPClient http;
+  if (!beginApi(http, String("/api/sensores/esp32/") + apiDeviceId)) return;
+  char body[256];
+  snprintf(body, sizeof(body),
+    "{\"temperatura\":%.1f,\"umidade\":%.1f,\"irrigacaoLigada\":%s,\"ventilacaoLigada\":%s,"
+    "\"irrigacaoAutomatica\":%s,\"ventilacaoAutomatica\":%s}",
+    currentTemp, currentHumidity, isPumpOn ? "true" : "false", isVentOn ? "true" : "false",
+    scheduleEnabled ? "true" : "false", autoVent ? "true" : "false");
+  http.addHeader("Content-Type", "application/json");
+  int status = http.POST(body);
+  if (status == 201) telemetryChanged = false;
+  else if (status == 404 && !SMARTBERRY_ESP32_ID[0]) apiDeviceId = "";
+  else Serial.printf("Falha no envio da leitura: %d\n", status);
+  http.end();
+}
+
+bool executeCommand(const String &type, int value) {
+  if (type == "ACIONAR_IRRIGACAO") {
+    if (isPumpOn || scheduledPumpRunning || value < 1 || value > 300) return false;
+    setPump(true);
+    remotePumpStart = millis();
+    remotePumpDuration = value * 1000UL;
+    remotePumpTimed = true;
+  } else if (type == "PARAR_IRRIGACAO") {
+    if (scheduledPumpRunning) return false;
+    setPump(false);
+  } else if (type == "LIGAR_VENTILACAO" || type == "DESLIGAR_VENTILACAO") {
+    if (autoVent) return false;
+    setVent(type == "LIGAR_VENTILACAO");
+  } else if (type == "ALTERAR_INTERVALO" && value > 0 && value <= 3600) {
+    telemetryInterval = value * 1000UL;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+void confirmCommand() {
+  HTTPClient http;
+  if (!beginApi(http, "/api/comandos/" + pendingAck + "/" + pendingOutcome)) return;
+  int status = http.PATCH("");
+  http.end();
+  if (status == 200 || status == 404) {
+    prefs.remove("apiCommand");
+    pendingAck = "";
+  }
+}
+
+void pollCommand() {
+  if (pendingAck.length() > 0) {
+    confirmCommand();
+    return;
+  }
+  HTTPClient http;
+  if (!beginApi(http, String("/api/comandos/esp32/") + apiDeviceId + "/proximo")) return;
+  int status = http.GET();
+  String body;
+  if (status == 200) body = http.getString();
+  http.end();
+  if (status != 200) return;
+
+  cJSON *command = cJSON_Parse(body.c_str());
+  if (command == nullptr) return;
+  const char *commandId = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(command, "id"));
+  const char *deviceId = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(command, "esp32Id"));
+  const char *commandType = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(command, "tipo"));
+  String id = commandId == nullptr ? "" : commandId;
+  String type = commandType == nullptr ? "" : commandType;
+  bool correctDevice = deviceId != nullptr && apiDeviceId == deviceId;
+  const cJSON *number = cJSON_GetObjectItemCaseSensitive(command, "valor");
+  int value = cJSON_IsNumber(number) ? number->valueint : 0;
+  cJSON_Delete(command);
+  if (id.length() == 0 || !correctDevice) return;
+
+  // Registra a tentativa antes de acionar. Uma reinicialização nesse intervalo
+  // impede o reacionamento e comunica o resultado incerto como rejeitado.
+  if (prefs.putString("apiCommand", id + "/rejeitado") == 0) return;
+  pendingAck = id;
+  bool done = executeCommand(type, value);
+  pendingOutcome = done ? "executado" : "rejeitado";
+  if (done) prefs.putString("apiCommand", id + "/executado");
+  confirmCommand();
+}
+
+void syncApi() {
+  if (WiFi.status() != WL_CONNECTED || !SMARTBERRY_API_URL[0]
+      || !SMARTBERRY_API_KEY[0]) return;
+  unsigned long now = millis();
+  if (apiDeviceId.isEmpty()) {
+    if (lastRegistrationAttempt == 0 || now - lastRegistrationAttempt >= 5000) {
+      lastRegistrationAttempt = now;
+      registerDevice();
+    }
+    return;
+  }
+  if (now - lastTelemetry >= telemetryInterval
+      || (telemetryChanged && now - lastTelemetry >= 1000
+          && now - lastCommandPoll < 1000)) {
+    lastTelemetry = now;
+    sendTelemetry();
+  } else if (now - lastCommandPoll >= 1000) {
+    lastCommandPoll = now;
+    pollCommand();
+  }
+}
+
 // ======================================
 // SETUP
 // ======================================
@@ -1957,6 +2125,12 @@ void setup() {
 
   // Carrega configuracoes salvas
   loadSettings();
+  String savedCommand = prefs.getString("apiCommand", "");
+  int separator = savedCommand.indexOf('/');
+  if (separator > 0) {
+    pendingAck = savedCommand.substring(0, separator);
+    pendingOutcome = savedCommand.substring(separator + 1);
+  }
 
   // Rele da bomba inicia desligado
   digitalWrite(PUMP_PIN, PUMP_OFF);
@@ -2031,6 +2205,9 @@ void loop() {
   checkWiFi();
 
   // Verifica agendamento mesmo sem WiFi
+  if (remotePumpTimed && millis() - remotePumpStart >= remotePumpDuration) {
+    setPump(false);
+  }
   checkPumpSchedule();
 
   if (
@@ -2047,6 +2224,8 @@ void loop() {
     lastDhtRead = millis();
 
     float t = dht.readTemperature();
+    currentHumidity = dht.readHumidity();
+    validSensorSample = isfinite(t) && isfinite(currentHumidity);
 
     if (!isnan(t)) {
 
@@ -2068,5 +2247,6 @@ void loop() {
     checkTemperatureControl();
   }
 
+  syncApi();
   delay(1);
 }
