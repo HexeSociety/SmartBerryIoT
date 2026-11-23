@@ -78,7 +78,7 @@ bool validSensorSample = false;
 bool remotePumpTimed = false;
 unsigned long remotePumpStart = 0;
 unsigned long remotePumpDuration = 0;
-unsigned long lastRequestedPumpStop = 0;
+unsigned long ultimaParadaSolicitada = 0;
 bool remoteVentTimed = false;
 unsigned long remoteVentStart = 0;
 unsigned long remoteVentDuration = 0;
@@ -326,8 +326,8 @@ void handleTime() {
 // AGENDAMENTO DA BOMBA
 // ======================================
 
-void rememberRequestedPumpStop() {
-  lastRequestedPumpStop = millis();
+void registrarParadaSolicitada() {
+  ultimaParadaSolicitada = millis();
   struct tm local;
   if (scheduleEnabled && readClock(local)
       && local.tm_hour == scheduleHour && local.tm_min == scheduleMinute) {
@@ -1772,7 +1772,7 @@ void handleToggle() {
       return;
     }
 
-    if (isPumpOn) rememberRequestedPumpStop();
+    if (isPumpOn) registrarParadaSolicitada();
     setPump(!isPumpOn);
 
   } else if (device == "vent") {
@@ -1989,7 +1989,7 @@ void checkWiFi() {
 }
 
 // A rede é consultada com timeouts curtos para manter o painel e os relés responsivos.
-bool beginApi(HTTPClient &http, const String &path) {
+bool prepararRequisicaoApi(HTTPClient &http, const String &path) {
   if (!http.begin(String(SMARTBERRY_API_URL) + path)) return false;
   http.setConnectTimeout(500);
   http.setTimeout(700);
@@ -1997,13 +1997,13 @@ bool beginApi(HTTPClient &http, const String &path) {
   return true;
 }
 
-void registerDevice() {
+void cadastrarPlaca() {
   char code[19];
   snprintf(code, sizeof(code), "esp32-%012llx",
            static_cast<unsigned long long>(ESP.getEfuseMac() & 0xFFFFFFFFFFFFULL));
 
   HTTPClient http;
-  if (!beginApi(http, String("/api/esp32/registro/") + code)) return;
+  if (!prepararRequisicaoApi(http, String("/api/esp32/registro/") + code)) return;
   int status = http.PUT("");
   if (status == 200) {
     String body = http.getString();
@@ -2019,10 +2019,10 @@ void registerDevice() {
   http.end();
 }
 
-void sendTelemetry() {
+void enviarTelemetria() {
   if (!validSensorSample) return;
   HTTPClient http;
-  if (!beginApi(http, String("/api/sensores/esp32/") + apiDeviceId)) return;
+  if (!prepararRequisicaoApi(http, String("/api/sensores/esp32/") + apiDeviceId)) return;
   char body[256];
   snprintf(body, sizeof(body),
     "{\"temperatura\":%.1f,\"umidade\":%.1f,\"irrigacaoLigada\":%s,\"ventilacaoLigada\":%s,"
@@ -2038,18 +2038,18 @@ void sendTelemetry() {
   http.end();
 }
 
-bool executeCommand(const String &type, int value, bool apiScheduled) {
+bool executarComando(const String &type, int value, bool apiScheduled) {
   if (type == "ACIONAR_IRRIGACAO") {
     if (isPumpOn || scheduledPumpRunning || value < 1 || value > 300) return false;
-    if (apiScheduled && lastRequestedPumpStop != 0
-        && millis() - lastRequestedPumpStop < 30000UL) return false;
+    if (apiScheduled && ultimaParadaSolicitada != 0
+        && millis() - ultimaParadaSolicitada < 30000UL) return false;
     setPump(true);
     remotePumpStart = millis();
     remotePumpDuration = value * 1000UL;
     remotePumpTimed = true;
   } else if (type == "PARAR_IRRIGACAO") {
     if (scheduledPumpRunning) return false;
-    rememberRequestedPumpStop();
+    registrarParadaSolicitada();
     setPump(false);
   } else if (type == "CONFIGURAR_IRRIGACAO_AUTOMATICA") {
     if (!SMARTBERRY_WEB_PANEL_ENABLED) return false;
@@ -2079,9 +2079,9 @@ bool executeCommand(const String &type, int value, bool apiScheduled) {
   return true;
 }
 
-void confirmCommand() {
+void confirmarComando() {
   HTTPClient http;
-  if (!beginApi(http, "/api/comandos/" + pendingAck + "/" + pendingOutcome)) return;
+  if (!prepararRequisicaoApi(http, "/api/comandos/" + pendingAck + "/" + pendingOutcome)) return;
   int status = http.PATCH("");
   http.end();
   if (status == 200 || status == 404) {
@@ -2090,13 +2090,13 @@ void confirmCommand() {
   }
 }
 
-void pollCommand() {
+void consultarComando() {
   if (pendingAck.length() > 0) {
-    confirmCommand();
+    confirmarComando();
     return;
   }
   HTTPClient http;
-  if (!beginApi(http, String("/api/comandos/esp32/") + apiDeviceId + "/proximo")) return;
+  if (!prepararRequisicaoApi(http, String("/api/comandos/esp32/") + apiDeviceId + "/proximo")) return;
   int status = http.GET();
   String body;
   if (status == 200) body = http.getString();
@@ -2122,20 +2122,20 @@ void pollCommand() {
   // impede o reacionamento e comunica o resultado incerto como rejeitado.
   if (prefs.putString("apiCommand", id + "/rejeitado") == 0) return;
   pendingAck = id;
-  bool done = executeCommand(type, value, apiScheduled);
+  bool done = executarComando(type, value, apiScheduled);
   pendingOutcome = done ? "executado" : "rejeitado";
   if (done) prefs.putString("apiCommand", id + "/executado");
-  confirmCommand();
+  confirmarComando();
 }
 
-void syncApi() {
+void sincronizarApi() {
   if (WiFi.status() != WL_CONNECTED || !SMARTBERRY_API_URL[0]
       || !SMARTBERRY_API_KEY[0]) return;
   unsigned long now = millis();
   if (apiDeviceId.isEmpty()) {
     if (lastRegistrationAttempt == 0 || now - lastRegistrationAttempt >= 5000) {
       lastRegistrationAttempt = now;
-      registerDevice();
+      cadastrarPlaca();
     }
     return;
   }
@@ -2143,10 +2143,10 @@ void syncApi() {
       || (telemetryChanged && now - lastTelemetry >= 1000
           && now - lastCommandPoll < 1000)) {
     lastTelemetry = now;
-    sendTelemetry();
+    enviarTelemetria();
   } else if (now - lastCommandPoll >= 1000) {
     lastCommandPoll = now;
-    pollCommand();
+    consultarComando();
   }
 }
 
@@ -2293,6 +2293,6 @@ void loop() {
     checkTemperatureControl();
   }
 
-  syncApi();
+  sincronizarApi();
   delay(1);
 }
